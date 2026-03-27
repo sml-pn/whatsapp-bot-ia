@@ -1,13 +1,8 @@
 FROM node:18-slim
 
 RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
     git \
-    chromium \
     && rm -rf /var/lib/apt/lists/*
-
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
