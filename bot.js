@@ -1,78 +1,147 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const express = require('express');
-const fs = require('fs');
-const QRCode = require('qrcode');
+const express = require('express')
+const app = express()
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
+const QRCodeTerminal = require('qrcode-terminal')
+const pino = require('pino')
+const { Redis } = require('@upstash/redis')
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000
+const API_URL = process.env.API_URL || 'https://bot-whatsapp-wd45.onrender.com/mensagem'
 
-let ultimoQRCode = null;
+// Conectar ao Redis (Upstash)
+const redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+})
 
-// Servidor HTTP para mostrar o QR Code
+// Função para salvar a sessão no Redis
+async function saveSession(sessionData) {
+    try {
+        await redis.set('whatsapp-session', JSON.stringify(sessionData))
+        console.log('✅ Sessão salva no Redis')
+    } catch (err) {
+        console.error('❌ Falha ao salvar sessão:', err.message)
+    }
+}
+
+// Função para carregar a sessão do Redis
+async function loadSession() {
+    try {
+        const data = await redis.get('whatsapp-session')
+        if (data) {
+            console.log('✅ Sessão carregada do Redis')
+            return JSON.parse(data)
+        }
+    } catch (err) {
+        console.error('❌ Falha ao carregar sessão:', err.message)
+    }
+    return null
+}
+
+// Servidor HTTP para manter o Render ativo
 app.get('/', (req, res) => {
-    if (ultimoQRCode) {
-        res.send(`
-            <html>
-                <head>
-                    <title>WhatsApp Bot - QR Code</title>
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <style>
-                        body { font-family: Arial; text-align: center; padding: 20px; background: #000; color: #fff; }
-                        img { max-width: 100%; width: 300px; margin: 20px auto; }
-                        .info { color: #0f0; margin-top: 20px; }
-                    </style>
-                </head>
-                <body>
-                    <h1>📱 Escaneie o QR Code</h1>
-                    <img src="/qrcode.png" />
-                    <p class="info">Abra o WhatsApp Business > Configurações > WhatsApp Web > Vincular dispositivo</p>
-                </body>
-            </html>
-        `);
-    } else {
-        res.send('<h1>⏳ Aguardando QR Code...</h1><p>O bot está iniciando. Atualize a página em alguns segundos.</p>');
-    }
-});
+    res.send('Conector WhatsApp ONLINE 🚀')
+})
 
-app.get('/qrcode.png', async (req, res) => {
-    if (ultimoQRCode) {
-        const qrBuffer = await QRCode.toBuffer(ultimoQRCode);
-        res.set('Content-Type', 'image/png');
-        res.send(qrBuffer);
-    } else {
-        res.status(404).send('QR Code não disponível');
-    }
-});
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: sock?.user ? 'connected' : 'disconnected',
+        uptime: process.uptime()
+    })
+})
 
-// Inicia o servidor
+let sock = null
+let reconnectAttempts = 0
+
+async function start() {
+    console.log('🚀 Iniciando conector...')
+    
+    // Tentar carregar sessão salva
+    const savedSession = await loadSession()
+    
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info')
+    
+    // Se tiver sessão salva, restaura
+    if (savedSession) {
+        state.creds = savedSession.creds
+        if (savedSession.keys) state.keys = savedSession.keys
+    }
+    
+    sock = makeWASocket({
+        logger: pino({ level: 'silent' }),
+        auth: state,
+        browser: ['Chrome (Linux)', 'Desktop', '1.0.0'],
+        keepAliveIntervalMs: 25000,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0
+    })
+    
+    // Salvar credenciais quando atualizadas
+    sock.ev.on('creds.update', async () => {
+        const fullState = {
+            creds: sock.authState.creds,
+            keys: sock.authState.keys
+        }
+        await saveSession(fullState)
+        saveCreds()
+    })
+    
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update
+        
+        if (qr) {
+            console.log('📱 QR Code gerado! Escaneie com o WhatsApp:')
+            QRCodeTerminal.generate(qr, { small: true })
+        }
+        
+        if (connection === 'open') {
+            reconnectAttempts = 0
+            console.log('✅ Conectado ao WhatsApp!')
+            console.log(`📱 Número do BOT: ${sock.user.id}`)
+        }
+        
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+            
+            if (shouldReconnect) {
+                const delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 60000)
+                reconnectAttempts++
+                console.log(`🔄 Reconectando em ${delay/1000}s... (tentativa ${reconnectAttempts})`)
+                setTimeout(start, delay)
+            } else {
+                console.log('❌ Desconectado permanentemente. Escaneie o QR novamente.')
+            }
+        }
+    })
+    
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0]
+        if (!msg.message || msg.key.fromMe) return
+        
+        const jid = msg.key.remoteJid
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text
+        if (!text) return
+        
+        console.log(`📩 Mensagem de ${jid}: ${text}`)
+        
+        try {
+            const response = await fetch(API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ from: jid, texto: text })
+            })
+            const data = await response.json()
+            await sock.sendMessage(jid, { text: data.resposta || 'Erro' })
+            console.log(`✅ Resposta enviada`)
+        } catch (err) {
+            console.error('❌ Erro ao chamar API:', err.message)
+        }
+    })
+}
+
+// Inicia servidor e bot
 app.listen(PORT, () => {
-    console.log(`🌐 Servidor rodando em http://localhost:${PORT}`);
-    console.log(`📱 Acesse no seu celular: https://seu-app.onrender.com`);
-});
-
-// Configura o bot WhatsApp
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: { args: ['--no-sandbox'] }
-});
-
-client.on('message', async (message) => {
-    console.log(`Mensagem: ${message.body}`);
-    await message.reply('🤖 Bot online! Em breve com IA própria.');
-});
-
-client.on('qr', (qr) => {
-    console.log('📱 QR Code gerado!');
-    console.log('🌐 Acesse: https://seu-app.onrender.com');
-    ultimoQRCode = qr;
-    // Também mostra no terminal (opcional)
-    qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-    console.log('✅ Bot conectado com sucesso!');
-    ultimoQRCode = null;
-});
-
-client.initialize();
+    console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`)
+    start()
+})
